@@ -5,10 +5,23 @@ import time
 import mediapipe as mp
 import gdown
 import os
-import av
+import asyncio
+import logging
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import img_to_array
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import av  # Make sure to import av for VideoFrame usage
+
+# Suppress specific asyncio sendto errors (transport NoneType)
+def handle_asyncio_exception(loop, context):
+    msg = context.get("exception", context.get("message"))
+    if msg and "sendto" in str(msg):
+        # Suppress this specific error related to sendto NoneType
+        return
+    # For other exceptions, log normally
+    logging.error(f"Caught asyncio exception: {context}")
+
+asyncio.get_event_loop().set_exception_handler(handle_asyncio_exception)
 
 # Config
 IMG_SIZE = 48
@@ -30,6 +43,7 @@ st.markdown("<div class='title'>Real-Time Emotion Detection</div>", unsafe_allow
 st.markdown("<div class='subheader'>With Blink & Motion Spoof Detection</div>", unsafe_allow_html=True)
 st.markdown("---")
 
+# Model loader
 @st.cache_resource
 def load_emotion_model():
     model_path = "emotion_model.h5"
@@ -39,6 +53,8 @@ def load_emotion_model():
 
 model = load_emotion_model()
 
+
+# EAR Calculator
 def calculate_ear(landmarks, w, h):
     from math import dist
     p1 = (int(landmarks[0].x * w), int(landmarks[0].y * h))
@@ -50,13 +66,13 @@ def calculate_ear(landmarks, w, h):
     return (dist(p2, p6) + dist(p3, p5)) / (2.0 * dist(p1, p4))
 
 
+# Video Processor Class
 class EmotionVideoProcessor(VideoProcessorBase):
     def __init__(self, model):
         self.model = model
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(refine_landmarks=True)
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.blink_counter = 0
         self.frame_counter = 0
         self.prev_face_coords = None
@@ -111,6 +127,7 @@ class EmotionVideoProcessor(VideoProcessorBase):
                 cv2.putText(image, "SPOOF DETECTED", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # Emotion prediction
             if face_detected and is_live_face and len(faces) > 0:
                 (x, y, w_box, h_box) = faces[0]
                 face_roi = gray[y:y + h_box, x:x + w_box]
@@ -129,21 +146,17 @@ class EmotionVideoProcessor(VideoProcessorBase):
             return av.VideoFrame.from_ndarray(image, format="bgr24")
 
         except Exception as e:
-            # Log error, then trigger a rerun to reset the app
-            st.error(f"Error processing video frame: {e}")
-            st.experimental_set_query_params()  # Optional: clear query params before rerun
-            st.rerun()
+            # Log error and skip frame (return input frame unmodified)
+            print(f"Error processing frame: {e}")
+            return frame
 
 
+# Factory
 def processor_factory():
     return EmotionVideoProcessor(model)
 
 
-# Add a manual restart button in UI
-if st.button("Restart Stream"):
-    st.rerun()
-
-
+# Run webrtc streamer
 webrtc_streamer(
     key="emotion-detection",
     video_processor_factory=processor_factory,
