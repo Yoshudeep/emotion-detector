@@ -21,7 +21,15 @@ def handle_asyncio_exception(loop, context):
     # For other exceptions, log normally
     logging.error(f"Caught asyncio exception: {context}")
 
-asyncio.get_event_loop().set_exception_handler(handle_asyncio_exception)
+def set_asyncio_exception_handler():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.set_exception_handler(handle_asyncio_exception)
+
+set_asyncio_exception_handler()
 
 # Config
 IMG_SIZE = 48
