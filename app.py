@@ -5,6 +5,7 @@ import time
 import mediapipe as mp
 import gdown
 import os
+import av
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import img_to_array
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
@@ -29,7 +30,6 @@ st.markdown("<div class='title'>Real-Time Emotion Detection</div>", unsafe_allow
 st.markdown("<div class='subheader'>With Blink & Motion Spoof Detection</div>", unsafe_allow_html=True)
 st.markdown("---")
 
-# Model loader
 @st.cache_resource
 def load_emotion_model():
     model_path = "emotion_model.h5"
@@ -39,8 +39,6 @@ def load_emotion_model():
 
 model = load_emotion_model()
 
-
-# EAR Calculator
 def calculate_ear(landmarks, w, h):
     from math import dist
     p1 = (int(landmarks[0].x * w), int(landmarks[0].y * h))
@@ -52,13 +50,13 @@ def calculate_ear(landmarks, w, h):
     return (dist(p2, p6) + dist(p3, p5)) / (2.0 * dist(p1, p4))
 
 
-# Video Processor Class
 class EmotionVideoProcessor(VideoProcessorBase):
     def __init__(self, model):
         self.model = model
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(refine_landmarks=True)
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        self.face_cascade = cv2.CascadeClassifier(cascade_path)
         self.blink_counter = 0
         self.frame_counter = 0
         self.prev_face_coords = None
@@ -66,77 +64,86 @@ class EmotionVideoProcessor(VideoProcessorBase):
         self.last_blink_time = time.time()
 
     def recv(self, frame):
-        image = frame.to_ndarray(format="bgr24")
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        h, w = image.shape[:2]
+        try:
+            image = frame.to_ndarray(format="bgr24")
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            h, w = image.shape[:2]
 
-        result = self.face_mesh.process(rgb)
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-        face_detected = False
-        is_live_face = False
+            result = self.face_mesh.process(rgb)
+            faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+            face_detected = False
+            is_live_face = False
 
-        if result.multi_face_landmarks:
-            landmarks = result.multi_face_landmarks[0]
-            eye_points = [landmarks.landmark[i] for i in EYE_LANDMARKS]
-            ear = calculate_ear(eye_points, w, h)
+            if result.multi_face_landmarks:
+                landmarks = result.multi_face_landmarks[0]
+                eye_points = [landmarks.landmark[i] for i in EYE_LANDMARKS]
+                ear = calculate_ear(eye_points, w, h)
 
-            if ear < EAR_THRESHOLD:
-                self.frame_counter += 1
+                if ear < EAR_THRESHOLD:
+                    self.frame_counter += 1
+                else:
+                    if self.frame_counter >= CONSEC_FRAMES:
+                        self.blink_counter += 1
+                        self.last_blink_time = time.time()
+                    self.frame_counter = 0
+                face_detected = True
+
+            if len(faces) > 0:
+                (x, y, w_box, h_box) = faces[0]
+                if self.prev_face_coords:
+                    dx = abs(x - self.prev_face_coords[0])
+                    dy = abs(y - self.prev_face_coords[1])
+                    if dx > 5 or dy > 5:
+                        self.last_movement_time = time.time()
+                self.prev_face_coords = (x, y)
+
+            time_since_blink = time.time() - self.last_blink_time
+            time_since_move = time.time() - self.last_movement_time
+
+            is_live_face = (time_since_blink < 3) and (time_since_move < 3)
+
+            # Overlay
+            if is_live_face:
+                cv2.putText(image, "LIVE FACE", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
             else:
-                if self.frame_counter >= CONSEC_FRAMES:
-                    self.blink_counter += 1
-                    self.last_blink_time = time.time()
-                self.frame_counter = 0
-            face_detected = True
+                cv2.putText(image, "SPOOF DETECTED", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        if len(faces) > 0:
-            (x, y, w_box, h_box) = faces[0]
-            if self.prev_face_coords:
-                dx = abs(x - self.prev_face_coords[0])
-                dy = abs(y - self.prev_face_coords[1])
-                if dx > 5 or dy > 5:
-                    self.last_movement_time = time.time()
-            self.prev_face_coords = (x, y)
+            if face_detected and is_live_face and len(faces) > 0:
+                (x, y, w_box, h_box) = faces[0]
+                face_roi = gray[y:y + h_box, x:x + w_box]
+                face_resized = cv2.resize(face_roi, (IMG_SIZE, IMG_SIZE))
+                face_resized = np.expand_dims(face_resized, axis=-1)
+                face_array = img_to_array(face_resized)
+                face_array = np.expand_dims(face_array, axis=0) / 255.0
 
-        time_since_blink = time.time() - self.last_blink_time
-        time_since_move = time.time() - self.last_movement_time
+                preds = self.model.predict(face_array, verbose=0)
+                emotion = emotion_labels[np.argmax(preds)]
 
-        is_live_face = (time_since_blink < 3) and (time_since_move < 3)
+                cv2.rectangle(image, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
+                cv2.putText(image, f'{emotion.upper()}', (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
-        # Overlay
-        if is_live_face:
-            cv2.putText(image, "LIVE FACE", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
-        else:
-            cv2.putText(image, "SPOOF DETECTED", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return av.VideoFrame.from_ndarray(image, format="bgr24")
 
-        # Emotion prediction
-        if face_detected and is_live_face and len(faces) > 0:
-            (x, y, w_box, h_box) = faces[0]
-            face_roi = gray[y:y + h_box, x:x + w_box]
-            face_resized = cv2.resize(face_roi, (IMG_SIZE, IMG_SIZE))
-            face_resized = np.expand_dims(face_resized, axis=-1)
-            face_array = img_to_array(face_resized)
-            face_array = np.expand_dims(face_array, axis=0) / 255.0
-
-            preds = self.model.predict(face_array, verbose=0)
-            emotion = emotion_labels[np.argmax(preds)]
-
-            cv2.rectangle(image, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
-            cv2.putText(image, f'{emotion.upper()}', (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
+        except Exception as e:
+            # Log error, then trigger a rerun to reset the app
+            st.error(f"Error processing video frame: {e}")
+            st.experimental_set_query_params()  # Optional: clear query params before rerun
+            st.rerun()
 
 
-# Factory
 def processor_factory():
     return EmotionVideoProcessor(model)
 
 
-# Run webrtc streamer
+# Add a manual restart button in UI
+if st.button("Restart Stream"):
+    st.rerun()
+
+
 webrtc_streamer(
     key="emotion-detection",
     video_processor_factory=processor_factory,
